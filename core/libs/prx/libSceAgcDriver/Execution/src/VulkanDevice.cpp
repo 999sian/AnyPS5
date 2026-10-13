@@ -3880,6 +3880,10 @@ VkDevice VulkanDevice::Device() const {
     return state->device;
 }
 
+bool VulkanDevice::DmaBufImportSelected() const {
+    return Graphics::DmaBufImportSelected(graphicsContext());
+}
+
 bool VulkanDevice::DispatchRecipes() {
     static const bool noDispatchRecipe = std::getenv("APS5_NO_DISPATCH_RECIPE") != nullptr;
     return !noDispatchRecipe;
