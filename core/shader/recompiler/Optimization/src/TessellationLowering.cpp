@@ -39,6 +39,13 @@ bool Same(const Affine& left, const Affine& right) {
     return !left.dynamic && !right.dynamic && left == right;
 }
 
+std::optional<Affine> CommonMultiple(const Affine& left, const Affine& right) {
+    if (left.vertex != right.vertex || left.relative != right.relative || left.constant != right.constant) return std::nullopt;
+    const auto multiple = std::gcd(left.dynamic ? left.dynamicScale : 0, right.dynamic ? right.dynamicScale : 0);
+    if (multiple == 0) return std::nullopt;
+    return Affine{left.vertex, left.relative, left.constant, true, multiple, nullptr};
+}
+
 [[noreturn]] void Fail(const char* reason, std::uint32_t pc) {
     char text[256];
     std::snprintf(text, sizeof(text), "tessellation lowering: %s at pc 0x%x", reason, pc);
@@ -412,7 +419,7 @@ private:
         case IrOpcode::ShiftLeftLogical32: {
             const auto lhs = argument(0);
             const auto shift = scalar(1);
-            if (!lhs || !shift || *shift >= 31) return std::nullopt;
+            if (!lhs || !shift || *shift < 0 || *shift >= 31) return std::nullopt;
             return scale(*lhs, 1ll << *shift);
         }
         case IrOpcode::ShiftRightLogical32: {
@@ -440,7 +447,7 @@ private:
             const auto source = argument(0);
             const auto offset = scalar(1);
             const auto count = scalar(2);
-            if (!source || !offset || !count) return std::nullopt;
+            if (!source || !offset || !count || *count < 0) return std::nullopt;
             if (*count == 0) return Affine{};
             const auto shifted = shiftRight(*source, *offset);
             if (!shifted || *count >= 32) return shifted;
@@ -450,18 +457,22 @@ private:
             if (active != nullptr && Implies(active, value->Argument(0))) return argument(1);
             const auto lhs = argument(1);
             const auto rhs = argument(2);
-            return lhs && rhs && Same(*lhs, *rhs) ? lhs : std::nullopt;
+            if (!lhs || !rhs) return std::nullopt;
+            if (Same(*lhs, *rhs)) return lhs;
+            return dynamic ? CommonMultiple(*lhs, *rhs) : std::nullopt;
         }
         default:
             break;
         }
         if (!value->IsPhi() || value->ArgumentCount() == 0) return std::nullopt;
-        const auto first = argument(0);
-        for (std::size_t index = 1; first && index < value->ArgumentCount(); ++index) {
+        auto result = argument(0);
+        for (std::size_t index = 1; result && index < value->ArgumentCount(); ++index) {
             const auto other = argument(index);
-            if (!other || !Same(*other, *first)) return std::nullopt;
+            if (!other) return std::nullopt;
+            if (Same(*result, *other)) continue;
+            result = dynamic ? CommonMultiple(*result, *other) : std::nullopt;
         }
-        return first && !first->dynamic ? first : std::nullopt;
+        return result && (dynamic || !result->dynamic) ? result : std::nullopt;
     }
 
     std::uint32_t vertexCount;
@@ -576,6 +587,7 @@ public:
         if (data) requireGroupedPatches();
         for (IrValue* base : relative) base->ReplaceAllUsesWith(data ? &groupedPatch(*base) : &constant(0u));
         deadCodeEliminator.Eliminate(program);
+        if (stage == IrShaderStage::Local && tessellation.drawParameters) writeInstance();
         program.Metadata().tessellationLocalStride = localStride;
         program.Metadata().tessellationControlStride = controlStride;
         program.Metadata().tessellationPatchStride = patchStride;
@@ -773,7 +785,9 @@ private:
     void requireGroupedPatches() const {
         if (stage == IrShaderStage::Local) Fail("the relative patch or vertex index is used outside a tessellation ring or LDS address", 0u);
         if (tessellation.primitiveGroupSize == 0u) Fail(stage == IrShaderStage::TessellationControl ? "the hull program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed" : "the domain program uses its relative patch index as data, but GE_CNTL.PRIM_GRP_SIZE is 0 or not programmed", 0u);
-        if (!tessellation.breakAtInstance) Fail(stage == IrShaderStage::TessellationControl ? "the hull program uses its relative patch index as data, but GE_CNTL.BREAK_WAVE_AT_EOI is clear, so the instances of a draw can share hull threadgroups" : "the domain program uses its relative patch index as data, but GE_CNTL.BREAK_WAVE_AT_EOI is clear, so the instances of a draw can share hull threadgroups", 0u);
+        if (tessellation.instancePatches == 0u || restartsPerInstance()) return;
+        if (stage == IrShaderStage::TessellationEvaluation) Fail("the domain program uses its relative patch index as data in an instanced draw whose instances share hull threadgroups (GE_CNTL.BREAK_WAVE_AT_EOI clear)", 0u);
+        if (!tessellation.drawParameters) Fail("the hull program uses its relative patch index as data in an instanced draw whose instances share hull threadgroups, which needs the device's shaderDrawParameters", 0u);
     }
 
     IrValue& groupedPatch(IrValue& base) {
@@ -787,8 +801,14 @@ private:
             IrValue& count = constant(divisor);
             return emit(IrOpcode::ISub32, {&value, &emit(IrOpcode::IMul32, {&emit(IrOpcode::UDiv32, {&value, &count}), &count})});
         };
-        IrValue& primitive = emit(IrOpcode::GetBuiltin, {&constant(static_cast<std::uint32_t>(StageInputKind::PrimitiveId)), &constant(0u)});
-        return remainder(remainder(primitive, tessellation.primitiveGroupSize), tessellation.patchesPerGroup);
+        IrValue* primitive = &emit(IrOpcode::GetBuiltin, {&constant(static_cast<std::uint32_t>(StageInputKind::PrimitiveId)), &constant(0u)});
+        if (tessellation.instancePatches != 0u && !restartsPerInstance()) {
+            IrValue& always = program.CreateValue(IrOpcode::Void, IrType::Bool);
+            always.SetImmediateBool(true);
+            IrValue& instance = emit(IrOpcode::GetTessellationAttribute, {&constant(static_cast<std::uint32_t>(TessellationAttribute::InstanceInput)), &constant(0u), &always});
+            primitive = &emit(IrOpcode::IAdd32, {&emit(IrOpcode::IMul32, {&instance, &constant(tessellation.instancePatches)}), primitive});
+        }
+        return remainder(remainder(*primitive, tessellation.primitiveGroupSize), tessellation.patchesPerGroup);
     }
 
     void removeUnobservedCycles() {
@@ -833,6 +853,33 @@ private:
         return result;
     }
 
+    [[nodiscard]] bool restartsPerInstance() const {
+        const auto patches = tessellation.instancePatches;
+        const auto group = tessellation.primitiveGroupSize;
+        return group != 0u && (patches % group == 0u || (group % tessellation.patchesPerGroup == 0u && patches % tessellation.patchesPerGroup == 0u));
+    }
+
+    void writeInstance() {
+        IrBlock* entry = program.BlockOrder().front();
+        IrValue* first = entry->Instructions().empty() ? nullptr : entry->Instructions().front();
+        const auto place = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments) -> IrValue& {
+            IrValue& value = program.CreateValue(opcode, type);
+            for (IrValue* argument : arguments) value.AddArgument(argument);
+            if (first != nullptr) {
+                entry->InsertInstructionBefore(first, &value);
+            } else {
+                entry->AppendInstruction(&value);
+            }
+            return value;
+        };
+        IrValue& index = place(IrOpcode::GetBuiltin, IrType::U32, {&constant(static_cast<std::uint32_t>(StageInputKind::InstanceIndex)), &constant(0u)});
+        IrValue& base = place(IrOpcode::GetBuiltin, IrType::U32, {&constant(static_cast<std::uint32_t>(StageInputKind::BaseInstance)), &constant(0u)});
+        IrValue& instance = place(IrOpcode::ISub32, IrType::U32, {&index, &base});
+        IrValue& truth = program.CreateValue(IrOpcode::Void, IrType::Bool);
+        truth.SetImmediateBool(true);
+        static_cast<void>(place(IrOpcode::SetTessellationAttribute, IrType::Void, {&constant(static_cast<std::uint32_t>(TessellationAttribute::InstanceOutput)), &constant(0u), &instance, &truth}));
+    }
+
     IrValue& insert(const Access& access, IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments) {
         IrValue& value = program.CreateValue(opcode, type);
         for (IrValue* argument : arguments) value.AddArgument(argument);
@@ -841,7 +888,10 @@ private:
     }
 
     IrValue& componentAddress(const Access& access, std::uint32_t component) {
-        if (access.address.dynamic) return insert(access, IrOpcode::IAdd32, IrType::U32, {access.addressValue, &constant(access.memoryOffset + 4u * component)});
+        if (access.address.dynamic) {
+            const std::uint32_t byteOffset = access.memoryOffset + 4u * component;
+            return byteOffset == 0u ? *access.addressValue : insert(access, IrOpcode::IAdd32, IrType::U32, {access.addressValue, &constant(byteOffset)});
+        }
         auto address = access.address.constant + 4 * static_cast<std::int64_t>(component);
         if (access.kind == TessellationAttribute::PatchOutput || access.kind == TessellationAttribute::PatchInput) address -= FloorDiv(address, patchStride) * patchStride;
         IrValue& offset = constant(static_cast<std::uint32_t>(address));
